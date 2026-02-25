@@ -35,15 +35,17 @@ import "dotenv/config";
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const PORT                  = Number(process.env.PORT ?? 8000);
-const SPEECH_KEY            = process.env.AZURE_SPEECH_KEY ?? "";
-const SPEECH_REGION         = process.env.AZURE_SPEECH_REGION ?? "";
-const SUPABASE_JWT_SECRET   = process.env.SUPABASE_JWT_SECRET ?? "";
-const ALLOWED_ORIGINS       = (process.env.ALLOWED_ORIGINS ?? "*").split(",").map(s => s.trim());
+const PORT = Number(process.env.PORT ?? 8000);
+const SPEECH_KEY = process.env.AZURE_SPEECH_KEY ?? "";
+const SPEECH_REGION = process.env.AZURE_SPEECH_REGION ?? "";
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET ?? "";
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "*")
+  .split(",")
+  .map((s) => s.trim());
 const MAX_CONNECTIONS_PER_IP = Number(process.env.MAX_CONNECTIONS_PER_IP ?? 3);
-const RATE_LIMIT_MESSAGES   = Number(process.env.RATE_LIMIT_MESSAGES ?? 100);
-const RATE_LIMIT_WINDOW_MS  = Number(process.env.RATE_LIMIT_WINDOW_MS ?? 10000);
-const SESSION_COOLDOWN_MS   = Number(process.env.SESSION_COOLDOWN_MS ?? 5000);
+const RATE_LIMIT_MESSAGES = Number(process.env.RATE_LIMIT_MESSAGES ?? 100);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS ?? 10000);
+const SESSION_COOLDOWN_MS = Number(process.env.SESSION_COOLDOWN_MS ?? 5000);
 
 if (!SPEECH_KEY || !SPEECH_REGION) {
   console.error("❌  AZURE_SPEECH_KEY and AZURE_SPEECH_REGION must be set.");
@@ -62,7 +64,11 @@ const ipStates = new Map<string, IPState>();
 
 function getIPState(ip: string): IPState {
   if (!ipStates.has(ip)) {
-    ipStates.set(ip, { connections: 0, lastDisconnect: 0, messageTimestamps: [] });
+    ipStates.set(ip, {
+      connections: 0,
+      lastDisconnect: 0,
+      messageTimestamps: [],
+    });
   }
   return ipStates.get(ip)!;
 }
@@ -72,14 +78,25 @@ function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
 
   // Check concurrent connection limit
   if (state.connections >= MAX_CONNECTIONS_PER_IP) {
-    return { allowed: false, reason: `Max ${MAX_CONNECTIONS_PER_IP} concurrent connections per IP` };
+    return {
+      allowed: false,
+      reason: `Max ${MAX_CONNECTIONS_PER_IP} concurrent connections per IP`,
+    };
   }
 
   // Check session cooldown
   const timeSinceLastDisconnect = Date.now() - state.lastDisconnect;
-  if (state.lastDisconnect > 0 && timeSinceLastDisconnect < SESSION_COOLDOWN_MS) {
-    const waitSec = Math.ceil((SESSION_COOLDOWN_MS - timeSinceLastDisconnect) / 1000);
-    return { allowed: false, reason: `Please wait ${waitSec}s before starting a new session` };
+  if (
+    state.lastDisconnect > 0 &&
+    timeSinceLastDisconnect < SESSION_COOLDOWN_MS
+  ) {
+    const waitSec = Math.ceil(
+      (SESSION_COOLDOWN_MS - timeSinceLastDisconnect) / 1000,
+    );
+    return {
+      allowed: false,
+      reason: `Please wait ${waitSec}s before starting a new session`,
+    };
   }
 
   return { allowed: true };
@@ -91,7 +108,7 @@ function checkMessageRate(ip: string): boolean {
 
   // Remove old timestamps outside the window
   state.messageTimestamps = state.messageTimestamps.filter(
-    t => now - t < RATE_LIMIT_WINDOW_MS
+    (t) => now - t < RATE_LIMIT_WINDOW_MS,
   );
 
   if (state.messageTimestamps.length >= RATE_LIMIT_MESSAGES) {
@@ -104,61 +121,129 @@ function checkMessageRate(ip: string): boolean {
 
 // ── JWT Validation (lightweight, without full library) ────────────────────────
 
+// ── JWT Validation — supports ES256 (P-256) and HS256 ────────────────────────
+
+// ── JWT Validation — supports ES256 (P-256) and HS256 ────────────────────────
+// Replace the entire base64UrlDecode + validateSupabaseToken block in server.ts
+// Also add SUPABASE_URL to your .env:
+//   SUPABASE_URL=https://hkiskbdykjaxvxjoxoqy.supabase.co
+
 function base64UrlDecode(str: string): string {
   const padded = str + "=".repeat((4 - (str.length % 4)) % 4);
   return Buffer.from(padded, "base64url").toString("utf8");
 }
 
-async function validateSupabaseToken(token: string): Promise<{ valid: boolean; userId?: string; error?: string }> {
-  if (!token) {
-    return { valid: false, error: "No auth token provided" };
+// JWKS cache — refreshed once per hour
+interface CachedKey {
+  kid: string;
+  pem: string;
+}
+let jwksCache: CachedKey[] = [];
+let jwksCacheTime = 0;
+
+async function getSigningPem(kid: string): Promise<string | null> {
+  const supabaseUrl = process.env.SUPABASE_URL ?? "";
+  if (!supabaseUrl) {
+    log("WARN", "SUPABASE_URL not set — cannot verify ES256 tokens");
+    return null;
   }
+
+  const now = Date.now();
+  if (jwksCache.length === 0 || now - jwksCacheTime > 3_600_000) {
+    try {
+      const res = await fetch(`${supabaseUrl}/auth/v1/.well-known/jwks.json`);
+      if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
+      const { keys } = (await res.json()) as { keys: any[] };
+
+      const cryptoMod = await import("crypto");
+      jwksCache = keys.map((jwk: any) => ({
+        kid: jwk.kid as string,
+        pem: cryptoMod
+          .createPublicKey({ key: jwk, format: "jwk" })
+          .export({ type: "spki", format: "pem" }) as string,
+      }));
+      jwksCacheTime = now;
+      log("INFO", `JWKS loaded — ${jwksCache.length} key(s)`);
+    } catch (err) {
+      log("ERROR", `Failed to load JWKS: ${String(err)}`);
+      return null;
+    }
+  }
+
+  return jwksCache.find((k) => k.kid === kid)?.pem ?? jwksCache[0]?.pem ?? null;
+}
+
+async function validateSupabaseToken(
+  token: string,
+): Promise<{ valid: boolean; userId?: string; error?: string }> {
+  if (!token) return { valid: false, error: "No auth token provided" };
 
   try {
     const parts = token.split(".");
-    if (parts.length !== 3) {
+    if (parts.length !== 3)
       return { valid: false, error: "Invalid token format" };
-    }
 
+    const header = JSON.parse(base64UrlDecode(parts[0]));
     const payload = JSON.parse(base64UrlDecode(parts[1]));
 
-    // Check expiration
     if (payload.exp && payload.exp < Date.now() / 1000) {
       return { valid: false, error: "Token expired" };
     }
-
-    // Check issuer (should be supabase)
     if (payload.iss && !payload.iss.includes("supabase")) {
       return { valid: false, error: "Invalid token issuer" };
     }
 
-    // If we have a JWT secret, verify the signature properly
-    if (SUPABASE_JWT_SECRET) {
-      const crypto = await import("crypto");
-      const signatureInput = parts[0] + "." + parts[1];
-      const expectedSig = crypto
-        .createHmac("sha256", SUPABASE_JWT_SECRET)
-        .update(signatureInput)
-        .digest("base64url");
+    const alg = (header.alg ?? "HS256") as string;
 
-      if (expectedSig !== parts[2]) {
-        return { valid: false, error: "Invalid token signature" };
+    if (alg === "ES256") {
+      const pem = await getSigningPem(header.kid);
+      if (!pem) {
+        log("WARN", "Skipping ES256 signature check (no key available)");
+      } else {
+        const cryptoMod = await import("crypto");
+        const signingInput = Buffer.from(parts[0] + "." + parts[1]);
+        const rawSig = Buffer.from(parts[2], "base64url");
+        const valid = cryptoMod.verify(
+          "SHA256",
+          signingInput,
+          { key: pem, dsaEncoding: "ieee-p1363" },
+          rawSig,
+        );
+        if (!valid) return { valid: false, error: "Invalid token signature" };
       }
+    } else if (alg === "HS256") {
+      if (SUPABASE_JWT_SECRET) {
+        const cryptoMod = await import("crypto");
+        const signatureInput = parts[0] + "." + parts[1];
+        const expectedSig = cryptoMod
+          .createHmac("sha256", SUPABASE_JWT_SECRET)
+          .update(signatureInput)
+          .digest("base64url");
+        if (expectedSig !== parts[2]) {
+          return { valid: false, error: "Invalid token signature" };
+        }
+      }
+    } else {
+      return { valid: false, error: `Unsupported JWT algorithm: ${alg}` };
     }
 
     return { valid: true, userId: payload.sub };
   } catch (err) {
-    return { valid: false, error: "Token validation failed" };
+    return { valid: false, error: `Token validation failed: ${String(err)}` };
   }
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-function log(level: "INFO" | "WARN" | "ERROR", msg: string, meta?: Record<string, unknown>) {
+function log(
+  level: "INFO" | "WARN" | "ERROR",
+  msg: string,
+  meta?: Record<string, unknown>,
+) {
   const ts = new Date().toISOString();
   const metaStr = meta ? " " + JSON.stringify(meta) : "";
   console[level === "ERROR" ? "error" : level === "WARN" ? "warn" : "log"](
-    `[${ts}] [${level}] ${msg}${metaStr}`
+    `[${ts}] [${level}] ${msg}${metaStr}`,
   );
 }
 
@@ -181,32 +266,42 @@ const httpServer = http.createServer((req, res) => {
 
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      status: "ok",
-      region: SPEECH_REGION,
-      model: "Azure Cognitive Services Speech SDK (ar-SA)",
-      note: "Speech processing runs only on this backend server",
-      activeConnections: [...ipStates.values()].reduce((sum, s) => sum + s.connections, 0),
-    }));
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        region: SPEECH_REGION,
+        model: "Azure Cognitive Services Speech SDK (ar-SA)",
+        note: "Speech processing runs only on this backend server",
+        activeConnections: [...ipStates.values()].reduce(
+          (sum, s) => sum + s.connections,
+          0,
+        ),
+      }),
+    );
     return;
   }
 
   if (req.url === "/architecture") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      speechModel: "Azure Cognitive Services Speech SDK",
-      modelNote: "This is NOT OpenAI Whisper. Uses Azure's enterprise speech service.",
-      language: "ar-SA (Arabic - Saudi Arabia)",
-      processing: "Server-side only (this Node.js backend)",
-      endpoint: "/ws/transcribe (WebSocket)",
-      frontendRole: "Captures microphone audio, sends raw PCM16 via WebSocket",
-      backendRole: "Receives audio, streams to Azure Speech, returns transcription",
-      security: {
-        auth: "Supabase JWT token required in config handshake",
-        rateLimiting: `${MAX_CONNECTIONS_PER_IP} concurrent per IP, ${RATE_LIMIT_MESSAGES} msgs/${RATE_LIMIT_WINDOW_MS}ms`,
-        cooldown: `${SESSION_COOLDOWN_MS}ms between sessions`,
-      },
-    }));
+    res.end(
+      JSON.stringify({
+        speechModel: "Azure Cognitive Services Speech SDK",
+        modelNote:
+          "This is NOT OpenAI Whisper. Uses Azure's enterprise speech service.",
+        language: "ar-SA (Arabic - Saudi Arabia)",
+        processing: "Server-side only (this Node.js backend)",
+        endpoint: "/ws/transcribe (WebSocket)",
+        frontendRole:
+          "Captures microphone audio, sends raw PCM16 via WebSocket",
+        backendRole:
+          "Receives audio, streams to Azure Speech, returns transcription",
+        security: {
+          auth: "Supabase JWT token required in config handshake",
+          rateLimiting: `${MAX_CONNECTIONS_PER_IP} concurrent per IP, ${RATE_LIMIT_MESSAGES} msgs/${RATE_LIMIT_WINDOW_MS}ms`,
+          cooldown: `${SESSION_COOLDOWN_MS}ms between sessions`,
+        },
+      }),
+    );
     return;
   }
 
@@ -219,7 +314,13 @@ const httpServer = http.createServer((req, res) => {
 const wss = new WebSocketServer({
   server: httpServer,
   path: "/ws/transcribe",
-  verifyClient: ({ origin, req }: { origin: string; req: http.IncomingMessage }) => {
+  verifyClient: ({
+    origin,
+    req,
+  }: {
+    origin: string;
+    req: http.IncomingMessage;
+  }) => {
     // Check origin
     if (!ALLOWED_ORIGINS.includes("*") && !ALLOWED_ORIGINS.includes(origin)) {
       log("WARN", "Rejected connection: origin not allowed", { origin });
@@ -227,11 +328,16 @@ const wss = new WebSocketServer({
     }
 
     // Check IP rate limit
-    const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-               req.socket.remoteAddress || "unknown";
+    const ip =
+      (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+      req.socket.remoteAddress ||
+      "unknown";
     const rateCheck = checkRateLimit(ip);
     if (!rateCheck.allowed) {
-      log("WARN", "Rejected connection: rate limited", { ip, reason: rateCheck.reason });
+      log("WARN", "Rejected connection: rate limited", {
+        ip,
+        reason: rateCheck.reason,
+      });
       return false;
     }
 
@@ -240,8 +346,10 @@ const wss = new WebSocketServer({
 });
 
 wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
-  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-             req.socket.remoteAddress || "unknown";
+  const ip =
+    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    "unknown";
   const state = getIPState(ip);
   state.connections++;
 
@@ -263,9 +371,14 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
 
   ws.on("message", async (data: Buffer | ArrayBuffer | Buffer[]) => {
     // ── Handle JSON messages (config, etc.) ──
-    if (typeof data === "string" || (Buffer.isBuffer(data) && !configReceived)) {
+    if (
+      typeof data === "string" ||
+      (Buffer.isBuffer(data) && !configReceived)
+    ) {
       try {
-        const str = Buffer.isBuffer(data) ? data.toString("utf8") : (data as unknown as string);
+        const str = Buffer.isBuffer(data)
+          ? data.toString("utf8")
+          : (data as unknown as string);
         const msg = JSON.parse(str);
 
         if (msg.type === "config") {
@@ -276,11 +389,13 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           const tokenResult = await validateSupabaseToken(msg.token ?? "");
           if (!tokenResult.valid) {
             log("WARN", "Auth failed", { ip, error: tokenResult.error });
-            ws.send(JSON.stringify({
-              type: "error",
-              message: `Authentication required: ${tokenResult.error}`,
-              code: "AUTH_REQUIRED",
-            }));
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: `Authentication required: ${tokenResult.error}`,
+                code: "AUTH_REQUIRED",
+              }),
+            );
             ws.close(4003, "Authentication required");
             return;
           }
@@ -290,7 +405,10 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           log("INFO", "User authenticated", { ip, userId });
 
           // ── Set up Azure Speech SDK ──
-          const speechConfig = sdk.SpeechConfig.fromSubscription(SPEECH_KEY, SPEECH_REGION);
+          const speechConfig = sdk.SpeechConfig.fromSubscription(
+            SPEECH_KEY,
+            SPEECH_REGION,
+          );
           speechConfig.speechRecognitionLanguage = msg.locale ?? "ar-SA";
           speechConfig.outputFormat = sdk.OutputFormat.Detailed;
           speechConfig.setProfanity(sdk.ProfanityOption.Raw);
@@ -336,7 +454,11 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
                 ws.send(JSON.stringify({ type: "final", text, words }));
               }
 
-              log("INFO", "Transcription", { userId, text: text.substring(0, 50), wordCount: words.length });
+              log("INFO", "Transcription", {
+                userId,
+                text: text.substring(0, 50),
+                wordCount: words.length,
+              });
             } else if (e.result.reason === sdk.ResultReason.NoMatch) {
               log("INFO", "No speech recognized", { userId });
             }
@@ -344,9 +466,17 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
 
           recognizer.canceled = (_s, e) => {
             if (e.reason === sdk.CancellationReason.Error) {
-              log("ERROR", "Azure Speech error", { userId, error: e.errorDetails });
+              log("ERROR", "Azure Speech error", {
+                userId,
+                error: e.errorDetails,
+              });
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "error", message: "Speech recognition error" }));
+                ws.send(
+                  JSON.stringify({
+                    type: "error",
+                    message: "Speech recognition error",
+                  }),
+                );
               }
             }
           };
@@ -359,7 +489,10 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
               }
             },
             (err) => {
-              log("ERROR", "Failed to start recognizer", { userId, error: String(err) });
+              log("ERROR", "Failed to start recognizer", {
+                userId,
+                error: String(err),
+              });
               ws.close(4500, "Recognizer start failed");
             },
           );
@@ -389,11 +522,13 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
     // Check message rate limit
     if (!checkMessageRate(ip)) {
       log("WARN", "Rate limited", { ip, userId });
-      ws.send(JSON.stringify({
-        type: "error",
-        message: "Rate limit exceeded. Please slow down.",
-        code: "RATE_LIMITED",
-      }));
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "Rate limit exceeded. Please slow down.",
+          code: "RATE_LIMITED",
+        }),
+      );
       return;
     }
 
@@ -402,10 +537,16 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
       if (data instanceof ArrayBuffer) {
         ab = data;
       } else if (Buffer.isBuffer(data)) {
-        ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+        ab = data.buffer.slice(
+          data.byteOffset,
+          data.byteOffset + data.byteLength,
+        ) as ArrayBuffer;
       } else {
         const merged = Buffer.concat(data as Buffer[]);
-        ab = merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength) as ArrayBuffer;
+        ab = merged.buffer.slice(
+          merged.byteOffset,
+          merged.byteOffset + merged.byteLength,
+        ) as ArrayBuffer;
       }
       pushStream.write(ab);
     } catch (err) {
@@ -418,7 +559,11 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
     state.connections = Math.max(0, state.connections - 1);
     state.lastDisconnect = Date.now();
 
-    log("INFO", "Client disconnected", { ip, userId, connections: state.connections });
+    log("INFO", "Client disconnected", {
+      ip,
+      userId,
+      connections: state.connections,
+    });
 
     if (pushStream) {
       pushStream.close();
