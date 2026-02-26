@@ -1,27 +1,6 @@
 """
 Quran Recitation Backend — Python / Tarteel Whisper
 ====================================================
-Replaces the Node.js Azure backend with a local GPU-accelerated server
-using tarteel-ai/whisper-base-ar-quran — a Whisper model fine-tuned
-specifically on Quran recitation audio.
-
-Architecture:
-  Browser mic → PCM16 @ 16kHz → WebSocket → buffer audio →
-  Whisper inference (GPU) → interim/final JSON → frontend word matching
-
-Requirements:
-  pip install fastapi uvicorn websockets torch transformers
-              numpy soundfile python-dotenv requests
-
-Run:
-  python server.py
-
-.env:
-  SUPABASE_URL=https://hkiskbdykjaxvxjoxoqy.supabase.co
-  ALLOWED_ORIGINS=http://localhost:5173
-  PORT=8000
-  DEVICE=cuda          # or cpu
-  CHUNK_SECONDS=2.5    # how often to transcribe (lower = more responsive)
 """
 
 import asyncio
@@ -30,7 +9,9 @@ import logging
 import os
 import time
 import base64
+import re
 from typing import Optional
+from collections import deque
 
 import numpy as np
 import requests
@@ -48,10 +29,10 @@ load_dotenv()
 PORT            = int(os.getenv("PORT", 8000))
 SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
 if not SUPABASE_URL:
-    logging.warning("SUPABASE_URL not set in .env — JWT signature check will be skipped")
+    logging.warning("SUPABASE_URL not set — JWT signature check skipped")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 DEVICE          = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-CHUNK_SECONDS   = float(os.getenv("CHUNK_SECONDS", 1.5))
+CHUNK_SECONDS   = float(os.getenv("CHUNK_SECONDS", 2.0))
 SAMPLE_RATE     = 16000
 MODEL_ID        = "tarteel-ai/whisper-base-ar-quran"
 
@@ -62,17 +43,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Load model at startup ─────────────────────────────────────────────────────
+# ── Load model ────────────────────────────────────────────────────────────────
 
 log.info(f"Loading {MODEL_ID} on {DEVICE}...")
 processor = WhisperProcessor.from_pretrained(MODEL_ID)
 model     = WhisperForConditionalGeneration.from_pretrained(MODEL_ID, revision="refs/pr/3")
 model.to(DEVICE)
 model.eval()
-
 log.info(f"Model loaded. Device: {DEVICE} | dtype: {next(model.parameters()).dtype}")
 
-# ── JWKS cache for ES256 JWT verification ─────────────────────────────────────
+# ── JWKS / JWT ────────────────────────────────────────────────────────────────
 
 _jwks_cache: dict = {}
 _jwks_cache_time: float = 0.0
@@ -96,7 +76,6 @@ def get_jwks() -> list:
         return []
 
 def validate_token(token: str) -> tuple[bool, Optional[str]]:
-    """Returns (valid, user_id)"""
     if not token:
         return False, None
     try:
@@ -104,7 +83,6 @@ def validate_token(token: str) -> tuple[bool, Optional[str]]:
         if len(parts) != 3:
             return False, None
 
-        # Decode header and payload
         def b64decode(s):
             s += "=" * (-len(s) % 4)
             return json.loads(base64.urlsafe_b64decode(s).decode())
@@ -112,68 +90,43 @@ def validate_token(token: str) -> tuple[bool, Optional[str]]:
         header  = b64decode(parts[0])
         payload = b64decode(parts[1])
 
-        # Check expiry
         if payload.get("exp", 0) < time.time():
-            log.warning("Token expired")
             return False, None
-
-        # Check issuer
-        iss = payload.get("iss", "")
-        if "supabase" not in iss:
-            log.warning(f"Invalid issuer: {iss}")
+        if "supabase" not in payload.get("iss", ""):
             return False, None
 
         alg = header.get("alg", "HS256")
-
         if alg == "ES256":
-            # Verify using JWKS public key
-            from cryptography.hazmat.primitives.asymmetric.ec import (
-                ECDSA, EllipticCurvePublicKey
-            )
+            from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicNumbers, SECP256R1
             from cryptography.hazmat.primitives.hashes import SHA256
-            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
             from cryptography.hazmat.backends import default_backend
-            from cryptography.hazmat.primitives.asymmetric.utils import (
-                decode_dss_signature, encode_dss_signature
-            )
+            from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
             from cryptography.exceptions import InvalidSignature
-            import struct
 
             kid  = header.get("kid")
             keys = get_jwks()
             jwk  = next((k for k in keys if k.get("kid") == kid), keys[0] if keys else None)
 
             if not jwk:
-                log.warning("No JWKS key available — skipping signature check")
+                log.warning("No JWKS key — skipping signature check")
                 return True, payload.get("sub")
 
-            # Import JWK as public key using cryptography library
-            from cryptography.hazmat.primitives.asymmetric.ec import (
-                EllipticCurvePublicNumbers, SECP256R1
-            )
             x = int.from_bytes(base64.urlsafe_b64decode(jwk["x"] + "=="), "big")
             y = int.from_bytes(base64.urlsafe_b64decode(jwk["y"] + "=="), "big")
-            pub_numbers = EllipticCurvePublicNumbers(x, y, SECP256R1())
-            pub_key = pub_numbers.public_key(default_backend())
+            pub_key = EllipticCurvePublicNumbers(x, y, SECP256R1()).public_key(default_backend())
 
-            # The JWT signature is IEEE P1363 format (raw r||s, 64 bytes for P-256)
-            # cryptography library needs DER format
             raw_sig = base64.urlsafe_b64decode(parts[2] + "==")
             half    = len(raw_sig) // 2
-            r       = int.from_bytes(raw_sig[:half], "big")
-            s       = int.from_bytes(raw_sig[half:], "big")
-            der_sig = encode_dss_signature(r, s)
-
-            signing_input = f"{parts[0]}.{parts[1]}".encode()
+            der_sig = encode_dss_signature(
+                int.from_bytes(raw_sig[:half], "big"),
+                int.from_bytes(raw_sig[half:], "big"),
+            )
             try:
-                pub_key.verify(der_sig, signing_input, ECDSA(SHA256()))
+                pub_key.verify(der_sig, f"{parts[0]}.{parts[1]}".encode(), ECDSA(SHA256()))
                 return True, payload.get("sub")
             except InvalidSignature:
-                log.warning("ES256 signature invalid")
                 return False, None
-
         else:
-            # HS256 or no secret — trust expiry+issuer
             log.warning(f"Algorithm {alg} — skipping signature check")
             return True, payload.get("sub")
 
@@ -181,44 +134,116 @@ def validate_token(token: str) -> tuple[bool, Optional[str]]:
         log.error(f"Token validation error: {e}")
         return False, None
 
-# ── Whisper transcription ─────────────────────────────────────────────────────
+# ── Silence detection ─────────────────────────────────────────────────────────
+
+# RMS threshold — audio below this is considered silence
+SILENCE_RMS   = 0.008
+# Minimum fraction of 10ms frames that must have signal
+MIN_ACTIVE    = 0.10
+
+def is_silent(samples: np.ndarray) -> bool:
+    rms = float(np.sqrt(np.mean(samples ** 2)))
+    if rms < SILENCE_RMS:
+        return True
+    frame_len = SAMPLE_RATE // 100  # 10ms
+    frames    = [samples[i:i+frame_len] for i in range(0, len(samples) - frame_len, frame_len)]
+    if not frames:
+        return True
+    active = sum(1 for f in frames if np.sqrt(np.mean(f ** 2)) > SILENCE_RMS)
+    return (active / len(frames)) < MIN_ACTIVE
+
+# ── Hallucination filter ──────────────────────────────────────────────────────
+
+# Strip diacritics for comparison
+def strip_diacritics(text: str) -> str:
+    return re.sub(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]', '', text)
+
+# Common Whisper hallucinations on Quran model when given silence/noise
+HALLUCINATION_BARE = {
+    strip_diacritics(t) for t in {
+        "والمؤمنين", "وَالْمُؤْمِنِينَ",
+        "سبحانك", "سُبْحَانَكَ",
+        "آمين", "أمين",
+        "صدق الله العظيم",
+        "الحمد لله",
+        "لا إله إلا الله",
+        "الله أكبر",
+        "بسم الله",
+        "وبحمده",
+        "سبحان الله وبحمده",
+        "اللهم صل على محمد",
+        "جزاكم الله خيرا",
+        "شكرا",
+    }
+}
+
+def is_hallucination(text: str) -> bool:
+    bare = strip_diacritics(text.strip())
+    # Exact match
+    if bare in HALLUCINATION_BARE:
+        return True
+    # Very short output (1-2 chars) is noise
+    if len(bare.replace(" ", "")) < 3:
+        return True
+    return False
+
+# ── Repetition guard ──────────────────────────────────────────────────────────
+
+def make_repetition_guard(max_repeats: int = 2, window: int = 6):
+    """
+    Returns a function that returns True if text has been seen too many
+    times in the recent window, indicating hallucination loop.
+    """
+    recent: deque = deque(maxlen=window)
+
+    def check(text: str) -> bool:
+        bare = strip_diacritics(text.strip())
+        count = sum(1 for t in recent if t == bare)
+        recent.append(bare)
+        return count >= max_repeats
+
+    return check
+
+# ── Transcription ─────────────────────────────────────────────────────────────
+
+MIN_AUDIO_BYTES = int(SAMPLE_RATE * 2 * 0.5)  # at least 0.5s of audio
 
 def transcribe(audio_pcm16: bytes) -> Optional[str]:
-    """Transcribe raw PCM16 mono 16kHz audio bytes using Tarteel Whisper."""
-    if len(audio_pcm16) < 3200:  # < 0.1s — skip
+    if len(audio_pcm16) < MIN_AUDIO_BYTES:
         return None
 
-    # Convert PCM16 → float32 numpy array
     samples = np.frombuffer(audio_pcm16, dtype=np.int16).astype(np.float32) / 32768.0
 
-    # Pad or truncate to Whisper's 30s window
+    if is_silent(samples):
+        log.debug("Silent chunk — skipped")
+        return None
+
+    # Use most recent 30s (Whisper max)
     max_samples = 30 * SAMPLE_RATE
     if len(samples) > max_samples:
-        samples = samples[-max_samples:]  # keep most recent
+        samples = samples[-max_samples:]
 
-    # Whisper feature extraction
-    inputs = processor(
-        samples,
-        sampling_rate=SAMPLE_RATE,
-        return_tensors="pt",
-    )
+    inputs = processor(samples, sampling_rate=SAMPLE_RATE, return_tensors="pt")
     input_features = inputs.input_features.to(DEVICE)
 
     with torch.no_grad():
-        predicted_ids = model.generate(
-            input_features,
-            max_new_tokens=128,
-        )
+        predicted_ids = model.generate(input_features, max_new_tokens=128)
 
     text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
-    # Also strip any remaining special token artifacts the tokenizer misses
-    import re
     text = re.sub(r"<\|[^|]+\|>", "", text).strip()
-    return text if text else None
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+    if not text:
+        return None
 
-app = FastAPI(title="Quran Recitation Backend — Tarteel Whisper")
+    if is_hallucination(text):
+        log.info(f"Hallucination rejected: {text}")
+        return None
+
+    return text
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Quran Recitation Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -229,12 +254,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model": MODEL_ID,
-        "device": DEVICE,
-        "chunk_seconds": CHUNK_SECONDS,
-    }
+    return {"status": "ok", "model": MODEL_ID, "device": DEVICE}
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
@@ -242,11 +262,12 @@ async def ws_transcribe(ws: WebSocket):
     client = ws.client.host if ws.client else "unknown"
     log.info(f"Client connected: {client}")
 
-    authenticated = False
-    user_id       = None
-    audio_buffer  = bytearray()   # accumulates PCM16 chunks
-    last_transcribe_time = time.time()
-    last_interim_text    = ""
+    authenticated    = False
+    user_id          = None
+    audio_buffer     = bytearray()
+    last_tx_time     = time.time()
+    last_text        = ""
+    is_repeated      = make_repetition_guard(max_repeats=2, window=6)
 
     async def send(msg: dict):
         try:
@@ -255,7 +276,7 @@ async def ws_transcribe(ws: WebSocket):
             pass
 
     try:
-        # ── Config handshake timeout ──────────────────────────────────────────
+        # Config handshake
         try:
             raw = await asyncio.wait_for(ws.receive(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -263,22 +284,17 @@ async def ws_transcribe(ws: WebSocket):
             await ws.close(4001)
             return
 
-        # Parse config message
         try:
             msg = json.loads(raw.get("text") or raw.get("bytes", b"{}").decode())
         except Exception:
-            await send({"type": "error", "message": "Invalid config", "code": "BAD_CONFIG"})
             await ws.close(4002)
             return
 
         if msg.get("type") != "config":
-            await send({"type": "error", "message": "Expected config message", "code": "BAD_CONFIG"})
             await ws.close(4002)
             return
 
-        # Validate auth token
-        token = msg.get("token", "")
-        valid, uid = validate_token(token)
+        valid, uid = validate_token(msg.get("token", ""))
         if not valid:
             await send({"type": "error", "message": "Authentication required", "code": "AUTH_REQUIRED"})
             await ws.close(4003)
@@ -287,67 +303,55 @@ async def ws_transcribe(ws: WebSocket):
         authenticated = True
         user_id       = uid
         log.info(f"User authenticated: {user_id}")
-
-        # Tell frontend we're ready
         await send({"type": "ready"})
 
-        # ── Main audio loop ───────────────────────────────────────────────────
-        chunk_bytes = int(CHUNK_SECONDS * SAMPLE_RATE * 2)  # 2 bytes per PCM16 sample
-
+        # Audio loop
         while True:
             try:
                 raw = await asyncio.wait_for(ws.receive(), timeout=30.0)
             except asyncio.TimeoutError:
-                break  # Client gone
+                break
 
-            # JSON control messages (updateRefText, etc.)
             if "text" in raw:
-                try:
-                    ctrl = json.loads(raw["text"])
-                    # Future: handle updateRefText for pronunciation assessment
-                    log.debug(f"Control message: {ctrl.get('type')}")
-                except Exception:
-                    pass
-                continue
+                continue  # control messages ignored
 
-            # Binary audio data
             chunk = raw.get("bytes")
             if not chunk:
                 continue
 
             audio_buffer.extend(chunk)
 
-            now = time.time()
-            elapsed = now - last_transcribe_time
+            now     = time.time()
+            elapsed = now - last_tx_time
 
-            # Run Whisper every CHUNK_SECONDS (or when buffer is large enough)
-            if elapsed >= CHUNK_SECONDS and len(audio_buffer) >= 3200:
-                # Run inference in thread pool so we don't block the event loop
-                audio_snapshot = bytes(audio_buffer)
-
-                loop = asyncio.get_event_loop()
-                text = await loop.run_in_executor(None, transcribe, audio_snapshot)
-
-                last_transcribe_time = now
-
-                if text and text != last_interim_text:
-                    last_interim_text = text
-                    # Send as interim while listening
-                    await send({"type": "interim", "text": text})
-                    log.info(f"Interim [{user_id[:8]}]: {text[:60]}")
-
-            # When buffer exceeds 8s, emit a final result and reset
-            if len(audio_buffer) >= int(8 * SAMPLE_RATE * 2):
-                audio_snapshot = bytes(audio_buffer)
+            if elapsed >= CHUNK_SECONDS and len(audio_buffer) >= MIN_AUDIO_BYTES:
+                snapshot = bytes(audio_buffer)
                 audio_buffer.clear()
-                last_interim_text = ""
+                last_tx_time = now
 
                 loop = asyncio.get_event_loop()
-                text = await loop.run_in_executor(None, transcribe, audio_snapshot)
+                text = await loop.run_in_executor(None, transcribe, snapshot)
 
-                if text:
-                    await send({"type": "final", "text": text, "words": []})
-                    log.info(f"Final [{user_id[:8]}]: {text[:60]}")
+                if text is None:
+                    # Silence or hallucination — reset repeat guard context
+                    last_text = ""
+                    continue
+
+                # Skip if exact same output as last chunk (repetition loop)
+                bare = strip_diacritics(text)
+                if bare == strip_diacritics(last_text):
+                    log.info(f"Skipping duplicate: {text}")
+                    continue
+
+                # Skip if seen too many times recently (hallucination loop)
+                if is_repeated(text):
+                    log.info(f"Repetition loop rejected: {text}")
+                    last_text = ""
+                    continue
+
+                last_text = text
+                await send({"type": "final", "text": text, "words": []})
+                log.info(f"Transcribed [{user_id[:8] if user_id else '?'}]: {text[:80]}")
 
     except WebSocketDisconnect:
         pass
@@ -358,19 +362,7 @@ async def ws_transcribe(ws: WebSocket):
         except Exception:
             pass
     finally:
-        # Flush remaining audio as final result
-        if authenticated and len(audio_buffer) >= 3200:
-            try:
-                text = transcribe(bytes(audio_buffer))
-                if text:
-                    await send({"type": "final", "text": text, "words": []})
-                    log.info(f"Flush final [{user_id[:8] if user_id else '?'}]: {text[:60]}")
-            except Exception:
-                pass
-
         log.info(f"Client disconnected: {client} (user={user_id})")
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     log.info(f"Starting Quran backend on port {PORT}")
