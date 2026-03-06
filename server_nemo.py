@@ -1,28 +1,26 @@
 """
-WhisperQuran Backend — FastConformer Transducer + Quran Text Matching
-======================================================================
-Phase 2: ASR transcription (with tashkeel) matched against known Quran text.
-
-Decoder: Transducer (RNNT) by default — outputs diacritized Arabic.
-         CTC available via DECODER_TYPE=ctc env var (faster, no tashkeel).
+WhisperQuran Backend — FastConformer + Quran Matching + Tajweed
+================================================================
+Phase 2: ASR transcription matched against known Quran text.
+Phase 3: Text-based tajweed rule annotations (no audio analysis).
 
 Features:
-  - Loads QuranDB on startup (all 6,236 verses with Uthmani tashkeel)
-  - Creates RecitationSession per WebSocket connection
-  - Two-tier word matching (diacritized + normalized fallback)
-  - Sends {"type":"match","words":[...]} with per-word similarity scores
-  - Word-level position tracking with retry counts
-  - Model warmup at startup to avoid first-call latency
+  - RNNT decoder with tashkeel (diacritized Arabic output)
+  - QuranDB: all 6,236 verses with Uthmani text
+  - RecitationSession: word-level position tracking per connection
+  - Tajweed annotations: 14 rule types identified from text alone
+  - REST endpoint: GET /tajweed/surah/{n} for frontend preloading
+  - WebSocket match messages include per-word tajweed rules
 
 Protocol:
   1. Client sends JSON config: {"type":"config","locale":"ar-SA","surah":2,"token":"JWT"}
-  2. Server validates JWT, loads QuranDB session, responds: {"type":"ready"}
+  2. Server validates JWT, loads session + tajweed, responds: {"type":"ready"}
   3. Client streams binary PCM16 @ 16kHz mono
-  4. Server accumulates chunks, runs Transducer inference every CHUNK_SECONDS
-  5. Server responds: {"type":"match","words":[...],"position":N,...}
+  4. Server accumulates chunks, runs RNNT inference every CHUNK_SECONDS
+  5. Server responds: {"type":"match","words":[{..., "tajweed":[...]}],...}
 
 Requirements:
-  pip install nemo_toolkit[asr] fastapi uvicorn websockets python-dotenv soundfile
+  pip install nemo_toolkit[asr] fastapi uvicorn websockets python-dotenv soundfile cuda-python>=12.3
 """
 
 import asyncio
@@ -46,6 +44,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Phase 2 imports
 from quran_db import get_quran_db, QuranDB
 from ctc_matcher import RecitationSession
+
+# Phase 3 imports
+from tajweed_rules import annotate_surah
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 
@@ -98,9 +99,7 @@ if DEVICE == "cuda":
 # Decoder: RNNT (Transducer) — outputs diacritical marks (tashkeel).
 # The PCD model was trained with Transducer as its primary decoder.
 # RNNT is NOT Whisper's autoregressive seq2seq — it doesn't hallucinate.
-#
-# Strategy: greedy_batch runs on GPU with batched decoding.
-# CUDA graph decoder gives max speed on RTX 3070.
+# Strategy: greedy_batch runs on GPU with CUDA graph acceleration.
 from nemo.collections.asr.models.rnnt_models import RNNTDecodingConfig
 from omegaconf import OmegaConf
 
@@ -124,7 +123,6 @@ def _warmup_model():
     """Run a short silent audio through the model to trigger JIT compilation
     and Lhotse initialization. This avoids a 5-10s delay on the first real request."""
     try:
-        import tempfile
         silence = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second of silence
         tmp = tempfile.mktemp(suffix=".wav")
         sf.write(tmp, silence, SAMPLE_RATE)
@@ -182,19 +180,11 @@ def make_repetition_guard(max_repeats: int = 3, window: int = 6):
 # ── Surah detection from refText ─────────────────────────────────────────────
 
 def detect_surah_from_config(msg: dict) -> Optional[int]:
-    """
-    Extract surah number from the config message.
-    
-    The frontend sends either:
-      - "surah": 2           (explicit, preferred)
-      - "refText": "بسم الله..."  (we can try to match against QuranDB)
-    """
-    # Explicit surah number
+    """Extract surah number from the config message."""
     surah = msg.get("surah")
     if isinstance(surah, int) and 1 <= surah <= 114:
         return surah
     
-    # Try to parse from refText (first word of first ayah)
     ref_text = msg.get("refText", "")
     if ref_text:
         results = quran_db.search(ref_text[:100], top_k=1)
@@ -206,13 +196,36 @@ def detect_surah_from_config(msg: dict) -> Optional[int]:
     
     return None
 
+# ── Phase 3: Build tajweed cache for a surah ─────────────────────────────────
+
+def build_tajweed_cache(surah_num: int) -> dict:
+    """
+    Build a dict mapping global_index → tajweed rules for a surah.
+    Called once per session/surah change, cached for the connection lifetime.
+    """
+    ann_list = annotate_surah(surah_num, quran_db)
+    cache = {}
+    for a in ann_list:
+        if a.has_rules:
+            cache[a.global_index] = [
+                {
+                    "rule": r.rule,
+                    "category": r.rule_category,
+                    "description": r.description,
+                    "arabicName": r.arabic_name,
+                    "harakatCount": r.harakat_count,
+                }
+                for r in a.rules
+            ]
+    return cache
+
 # ── Transcription ────────────────────────────────────────────────────────────
 
 MIN_AUDIO_BYTES = int(SAMPLE_RATE * 2 * 0.3)
 MIN_RMS         = 0.005
 
 def transcribe(audio_pcm16: bytes) -> Optional[str]:
-    """Run FastConformer inference on PCM16 audio. Uses RNNT (tashkeel) or CTC decoder."""
+    """Run FastConformer RNNT inference on PCM16 audio. Outputs diacritized Arabic."""
     if len(audio_pcm16) < MIN_AUDIO_BYTES:
         return None
 
@@ -250,7 +263,7 @@ def transcribe(audio_pcm16: bytes) -> Optional[str]:
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Quran Recitation Backend (FastConformer + QuranDB)")
+app = FastAPI(title="WhisperQuran Backend (FastConformer + QuranDB + Tajweed)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -271,7 +284,26 @@ def health():
             "verses": quran_db.total_verses,
             "surahs": quran_db.total_surahs,
         },
+        "features": ["transcription", "quran_matching", "tajweed_annotations"],
     }
+
+# ── Phase 3: Tajweed REST endpoint ───────────────────────────────────────────
+
+@app.get("/tajweed/surah/{surah_num}")
+def get_tajweed_annotations(surah_num: int):
+    """Return tajweed rule annotations for every word in a surah."""
+    if not 1 <= surah_num <= 114:
+        return {"error": "Invalid surah number"}
+    
+    annotations = annotate_surah(surah_num, quran_db)
+    return {
+        "surah": surah_num,
+        "totalWords": len(annotations),
+        "wordsWithRules": sum(1 for a in annotations if a.has_rules),
+        "words": [a.to_dict() for a in annotations if a.has_rules],
+    }
+
+# ── WebSocket handler ────────────────────────────────────────────────────────
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
@@ -281,7 +313,8 @@ async def ws_transcribe(ws: WebSocket):
 
     authenticated    = False
     user_id          = None
-    session          = None        # RecitationSession — Phase 2
+    session          = None             # RecitationSession — Phase 2
+    tajweed_cache    = {}               # Phase 3: global_index → tajweed rules
     audio_buffer     = bytearray()
     last_tx_time     = time.time()
     last_text        = ""
@@ -321,11 +354,13 @@ async def ws_transcribe(ws: WebSocket):
         authenticated = True
         user_id       = uid
 
-        # ── Phase 2: Create recitation session ───────────────────────────
+        # ── Phase 2 + 3: Create recitation session + tajweed cache ────────
         surah_num = detect_surah_from_config(msg)
         if surah_num:
             session = RecitationSession(surah=surah_num, db=quran_db)
-            log.info(f"[{user_id}] Session: surah {surah_num}, {session.total_words} words")
+            tajweed_cache = build_tajweed_cache(surah_num)
+            log.info(f"[{user_id}] Session: surah {surah_num}, "
+                     f"{session.total_words} words, {len(tajweed_cache)} tajweed annotations")
         else:
             log.info(f"[{user_id}] No surah detected — raw transcript mode")
 
@@ -352,11 +387,13 @@ async def ws_transcribe(ws: WebSocket):
                     new_surah = ctrl.get("surah")
                     if isinstance(new_surah, int) and 1 <= new_surah <= 114:
                         session = RecitationSession(surah=new_surah, db=quran_db)
+                        tajweed_cache = build_tajweed_cache(new_surah)
                         log.info(f"[{user_id}] Switched to surah {new_surah}")
                     elif ctrl.get("refText"):
                         detected = detect_surah_from_config(ctrl)
                         if detected:
                             session = RecitationSession(surah=detected, db=quran_db)
+                            tajweed_cache = build_tajweed_cache(detected)
                             log.info(f"[{user_id}] Detected surah {detected} from refText update")
                 
                 # Handle position reset
@@ -388,10 +425,7 @@ async def ws_transcribe(ws: WebSocket):
                 audio_buffer.clear()
                 last_tx_time = now
 
-                # Run inference in thread pool (RNNT or CTC depending on config).
-                # RNNT is slower (~1-2s, first call ~5s warmup) but outputs tashkeel.
-                # We use run_in_executor so the event loop stays alive to receive
-                # incoming audio frames while inference runs.
+                # Run RNNT inference in thread pool so event loop stays alive
                 loop = asyncio.get_event_loop()
                 text = await loop.run_in_executor(None, transcribe, snapshot)
 
@@ -409,16 +443,20 @@ async def ws_transcribe(ws: WebSocket):
 
                 last_text = text
 
-                # ── Phase 2: Match against known Quran text ──────────────
+                # ── Phase 2 + 3: Match + attach tajweed ──────────────────
                 if session:
                     result = session.match_transcript(
                         text,
                         threshold=MATCH_THRESHOLD,
                     )
                     wire = session.to_wire(result)
-                    
-                    # Also include the raw transcript for debugging/display
                     wire["transcript"] = text
+                    
+                    # Phase 3: Attach tajweed rules to each matched word
+                    for w in wire["words"]:
+                        taj = tajweed_cache.get(w["index"])
+                        if taj:
+                            w["tajweed"] = taj
                     
                     await send(wire)
                     
@@ -451,5 +489,6 @@ if __name__ == "__main__":
     log.info(f"Decoder: RNNT (with tashkeel)")
     log.info(f"Chunk:   {CHUNK_SECONDS}s")
     log.info(f"QuranDB: {quran_db.total_verses} verses loaded")
+    log.info(f"Tajweed: 14 rule types (text-based, Phase 3)")
     log.info(f"Match threshold: {MATCH_THRESHOLD}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
