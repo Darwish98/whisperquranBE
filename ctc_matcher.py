@@ -1,25 +1,21 @@
 """
-ctc_matcher.py — CTC Text Matching for WhisperQuran Phase 2
-============================================================
+ctc_matcher.py — Text Matching for WhisperQuran Phase 2
+========================================================
 
-Matches CTC transcription output against known Quran text.
+Matches ASR transcription output against known Quran text.
 Tracks word-level position within a surah.
 Returns per-word match results with confidence scores.
 
-This replaces the frontend's fuzzy string matching (arabicUtils.ts)
-with server-side matching that has access to:
-  - The full CTC transcript (with diacritics from FastConformer PCD)
-  - The complete Quran text database (QuranDB)
-  - Position tracking across multiple audio chunks
+TWO-TIER MATCHING (updated for Transducer decoder with tashkeel):
+  1. If both spoken and expected have diacritics → compare WITH tashkeel
+     (stricter, higher confidence, rewards correct harakat)
+  2. If spoken lacks diacritics (CTC mode) → compare normalized (stripped)
+     (lenient, still works, but capped at 0.90 max)
 
-Architecture:
-  Frontend sends: refText (surah words) + audio chunks
-  Backend runs:   CTC inference → ctc_matcher → word-level results
-  Backend sends:  {"type":"match","words":[...]} per chunk
-
-The key insight: we know what the reciter SHOULD be saying (the Quran
-is a closed corpus), so we score the transcript against known text
-instead of treating it as free-form ASR.
+This way:
+  - RNNT decoder outputs "بِسْمِ" → compared diacritized against "بِسْمِ" → 1.0
+  - CTC decoder outputs "بسم" → compared normalized against "بسم" → 0.90 max
+  - Wrong harakat "بُسْمِ" → diacritized comparison catches it → lower score
 """
 
 import logging
@@ -31,6 +27,14 @@ from quran_db import QuranDB, get_quran_db, normalize_arabic, levenshtein, strip
 
 log = logging.getLogger("whisperquran.matcher")
 
+# Regex to detect if a word has Arabic diacritics (harakat)
+HARAKAT_RE = re.compile(r'[\u064B-\u0652\u0670]')
+
+
+def has_tashkeel(text: str) -> bool:
+    """Check if Arabic text contains diacritical marks."""
+    return bool(HARAKAT_RE.search(text))
+
 
 # ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -40,7 +44,7 @@ class WordMatch:
     global_index: int           # Index in the flat surah word list
     expected: str               # Diacritized expected word
     expected_norm: str          # Normalized expected word
-    spoken: str                 # What the CTC heard
+    spoken: str                 # What the ASR heard
     spoken_norm: str            # Normalized spoken word
     similarity: float           # 0.0 - 1.0
     matched: bool               # True if similarity >= threshold
@@ -50,7 +54,7 @@ class WordMatch:
 
 @dataclass
 class MatchResult:
-    """Result of matching a CTC chunk against the current position."""
+    """Result of matching an ASR chunk against the current position."""
     words: List[WordMatch]      # Per-word match results
     words_matched: int          # How many words were successfully matched
     new_position: int           # Updated global word index after matching
@@ -120,16 +124,13 @@ class RecitationSession:
         max_lookahead: int = 3,
     ) -> MatchResult:
         """
-        Match a CTC transcript against expected words at current position.
+        Match an ASR transcript against expected words at current position.
         
-        Args:
-            transcript: Diacritized Arabic text from FastConformer CTC
-            threshold: Minimum similarity to accept a word match
-            max_lookahead: How many positions ahead to search for a match
-                          (handles word skips / insertions by ASR)
-        
-        Returns:
-            MatchResult with per-word details and updated position
+        Uses two-tier comparison:
+          - With tashkeel: if RNNT decoder provided diacritics, compare
+            diacritized text for higher accuracy (up to 1.0)
+          - Without tashkeel: if CTC decoder or stripped output, compare
+            normalized text (capped at 0.90)
         """
         if not transcript or not transcript.strip():
             return MatchResult(
@@ -160,6 +161,8 @@ class RecitationSession:
             if not spoken_norm:
                 continue
             
+            spoken_has_tashkeel = has_tashkeel(spoken)
+            
             # Try matching at current position + lookahead
             best_match = None
             best_sim = 0.0
@@ -167,7 +170,10 @@ class RecitationSession:
             
             for offset in range(min(max_lookahead, self.total_words - pos)):
                 expected = self.words[pos + offset]
-                sim = self._word_similarity(spoken_norm, expected.norm)
+                sim = self._word_similarity(
+                    spoken, spoken_norm, spoken_has_tashkeel,
+                    expected.text, expected.norm,
+                )
                 
                 if sim > best_sim:
                     best_sim = sim
@@ -264,36 +270,81 @@ class RecitationSession:
     @staticmethod
     def _split_arabic(text: str) -> List[str]:
         """Split Arabic text into words, handling various whitespace."""
-        # Remove common punctuation that FastConformer may include
         text = re.sub(r'[،؟.!,?]', ' ', text)
         return [w for w in text.strip().split() if w]
     
     @staticmethod
-    def _word_similarity(spoken_norm: str, expected_norm: str) -> float:
+    def _simplify_uthmani(t: str) -> str:
         """
-        Compute similarity between two normalized Arabic words.
-        Returns 0.0 - 1.0.
+        Simplify Uthmani-specific encoding differences that don't affect
+        pronunciation but cause string mismatches between ASR and QuranDB.
+        Keeps all harakat intact.
+        """
+        t = t.replace('\u0670', '')          # superscript alef (ٰ)
+        t = t.replace('\u0671', '\u0627')    # alef wasla (ٱ) → regular alef (ا)
+        # Remove Quran-specific pause/sajda marks
+        t = re.sub(r'[\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]', '', t)
+        t = t.replace('\u0640', '')           # tatweel
+        return t
+    
+    @staticmethod
+    def _word_similarity(
+        spoken_raw: str,
+        spoken_norm: str,
+        spoken_has_tashkeel: bool,
+        expected_raw: str,
+        expected_norm: str,
+    ) -> float:
+        """
+        Two-tier word similarity for Arabic Quran matching.
         
-        Uses Levenshtein distance on normalized text.
-        Includes bonuses for matching first character and article handling.
+        Tier 1 (diacritized): When ASR has tashkeel (RNNT decoder),
+        compare full diacritized forms. Catches wrong harakat.
+        Score range: 0.0 - 1.0
+        
+        Tier 2 (normalized): When ASR lacks tashkeel (CTC decoder),
+        compare stripped consonant forms. Capped at 0.90.
+        Score range: 0.0 - 0.90
         """
-        if spoken_norm == expected_norm:
+        # Exact diacritized match → perfect score
+        if spoken_raw == expected_raw:
             return 1.0
+        
+        # Exact normalized match
+        if spoken_norm == expected_norm:
+            if spoken_has_tashkeel:
+                return 0.85  # Consonants match but harakat differ
+            return 0.90  # No tashkeel — can't tell, give benefit
         
         if not spoken_norm or not expected_norm:
             return 0.0
         
-        # Base Levenshtein similarity
-        dist = levenshtein(spoken_norm, expected_norm)
-        max_len = max(len(spoken_norm), len(expected_norm))
-        sim = 1.0 - (dist / max_len)
+        # ── Tier 1: Diacritized comparison ─────────────────────────────────
+        diacritized_sim = 0.0
+        if spoken_has_tashkeel:
+            spoken_simp = RecitationSession._simplify_uthmani(spoken_raw)
+            expected_simp = RecitationSession._simplify_uthmani(expected_raw)
+            
+            if spoken_simp == expected_simp:
+                return 0.98  # Near-perfect, just Uthmani encoding diffs
+            
+            dist = levenshtein(spoken_simp, expected_simp)
+            max_len = max(len(spoken_simp), len(expected_simp))
+            diacritized_sim = 1.0 - (dist / max_len) if max_len > 0 else 0.0
+            
+            if spoken_simp and expected_simp and spoken_simp[0] == expected_simp[0]:
+                diacritized_sim += 0.02
         
-        # Bonus for matching first consonant
-        if spoken_norm[0] == expected_norm[0]:
-            sim += 0.03
+        # ── Tier 2: Normalized comparison (consonants only) ────────────────
+        dist_norm = levenshtein(spoken_norm, expected_norm)
+        max_len_norm = max(len(spoken_norm), len(expected_norm))
+        normalized_sim = 1.0 - (dist_norm / max_len_norm) if max_len_norm > 0 else 0.0
         
-        # Try with article stripped (ال / ٱل)
-        def strip_article(t):
+        if spoken_norm and expected_norm and spoken_norm[0] == expected_norm[0]:
+            normalized_sim += 0.03
+        
+        # Article stripping bonus
+        def strip_article(t: str) -> str:
             return re.sub(r'^(ال|ٱل|لل|لا)', '', t)
         
         spoken_stripped = strip_article(spoken_norm)
@@ -301,42 +352,22 @@ class RecitationSession:
         
         if spoken_stripped and expected_stripped:
             if spoken_stripped == expected_stripped:
-                return max(sim, 0.90)
-            
-            dist2 = levenshtein(spoken_stripped, expected_stripped)
-            max_len2 = max(len(spoken_stripped), len(expected_stripped))
-            sim2 = 1.0 - (dist2 / max_len2) + 0.03
-            sim = max(sim, sim2)
+                normalized_sim = max(normalized_sim, 0.88)
+            else:
+                dist2 = levenshtein(spoken_stripped, expected_stripped)
+                max_len2 = max(len(spoken_stripped), len(expected_stripped))
+                alt_sim = 1.0 - (dist2 / max_len2) + 0.03 if max_len2 > 0 else 0.0
+                normalized_sim = max(normalized_sim, alt_sim)
         
-        return min(1.0, sim)
+        # Cap normalized at 0.90 when spoken has no tashkeel
+        if not spoken_has_tashkeel:
+            normalized_sim = min(0.90, normalized_sim)
+        
+        final = max(diacritized_sim, normalized_sim)
+        return min(1.0, final)
     
     def to_wire(self, result: MatchResult) -> dict:
-        """
-        Convert MatchResult to JSON-serializable dict for WebSocket.
-        
-        Wire format matches what the frontend expects:
-        {
-            "type": "match",
-            "words": [
-                {
-                    "index": 0,           // global word index in surah
-                    "expected": "ٱلْحَمْدُ",
-                    "spoken": "الحمد",
-                    "similarity": 0.92,
-                    "matched": true,
-                    "ayah": 2,
-                    "wordInAyah": 0,
-                    "retries": 0
-                },
-                ...
-            ],
-            "position": 4,
-            "ayah": 2,
-            "wordsMatched": 4,
-            "totalWords": 29,
-            "complete": false
-        }
-        """
+        """Convert MatchResult to JSON for WebSocket."""
         return {
             "type": "match",
             "words": [
@@ -366,29 +397,56 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     db = get_quran_db()
+    
+    # ── Test 1: RNNT output WITH tashkeel ──────────────────────────────────
+    print("\n═══ Test 1: RNNT decoder (with tashkeel) ═══")
     session = RecitationSession(surah=1, db=db)
+    print(f"Surah 1: {session.total_words} words")
     
-    print(f"\nSurah 1: {session.total_words} words")
-    print(f"Words: {[w.text for w in session.words[:10]]}")
-    
-    # Simulate recitation chunks
-    chunks = [
+    chunks_rnnt = [
         "بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ",
         "ٱلْحَمْدُ لِلَّهِ رَبِّ ٱلْعَالَمِينَ",
         "ٱلرَّحْمَٰنِ ٱلرَّحِيمِ",
         "مَالِكِ يَوْمِ ٱلدِّينِ",
     ]
     
-    for chunk in chunks:
+    for chunk in chunks_rnnt:
         result = session.match_transcript(chunk)
-        wire = session.to_wire(result)
-        
-        print(f"\nChunk: '{chunk[:50]}...'")
-        print(f"  Matched: {result.words_matched} words, position → {result.new_position}")
+        print(f"\n  Chunk: '{chunk[:50]}...'")
+        print(f"  Matched: {result.words_matched}, position → {result.new_position}")
         for wm in result.words:
             status = "✓" if wm.matched else "✗"
-            print(f"    {status} [{wm.global_index}] '{wm.spoken}' → '{wm.expected}' "
-                  f"(sim={wm.similarity:.2f}, ayah={wm.ayah})")
+            print(f"    {status} [{wm.global_index}] sim={wm.similarity:.2f}  "
+                  f"'{wm.spoken}' → '{wm.expected}'")
     
-    print(f"\nFinal position: {session.position}/{session.total_words}")
-    print(f"Complete: {session.position >= session.total_words}")
+    # ── Test 2: CTC output WITHOUT tashkeel ────────────────────────────────
+    print("\n═══ Test 2: CTC decoder (no tashkeel) ═══")
+    session2 = RecitationSession(surah=1, db=db)
+    
+    chunks_ctc = [
+        "بسم الله الرحمن الرحيم",
+        "الحمد لله رب العالمين",
+    ]
+    
+    for chunk in chunks_ctc:
+        result = session2.match_transcript(chunk)
+        print(f"\n  Chunk: '{chunk[:50]}...'")
+        print(f"  Matched: {result.words_matched}, position → {result.new_position}")
+        for wm in result.words:
+            status = "✓" if wm.matched else "✗"
+            print(f"    {status} [{wm.global_index}] sim={wm.similarity:.2f}  "
+                  f"'{wm.spoken}' → '{wm.expected}'")
+    
+    # ── Test 3: Wrong harakat ──────────────────────────────────────────────
+    print("\n═══ Test 3: Wrong harakat detection ═══")
+    session3 = RecitationSession(surah=1, db=db)
+    
+    # رَبُّ instead of رَبِّ (wrong kasra→damma)
+    result = session3.match_transcript("بِسْمُ ٱللَّهِ")  # wrong damma on meem
+    print(f"\n  Wrong harakat: بِسْمُ (damma) vs بِسْمِ (kasra)")
+    for wm in result.words:
+        status = "✓" if wm.matched else "✗"
+        print(f"    {status} sim={wm.similarity:.2f}  '{wm.spoken}' → '{wm.expected}'")
+    
+    print(f"\nRNNT position: {session.position}/{session.total_words}")
+    print(f"CTC position:  {session2.position}/{session2.total_words}")

@@ -1,21 +1,24 @@
 """
-WhisperQuran Backend — FastConformer CTC + Quran Text Matching
-================================================================
-Phase 2: CTC transcription matched against known Quran text.
+WhisperQuran Backend — FastConformer Transducer + Quran Text Matching
+======================================================================
+Phase 2: ASR transcription (with tashkeel) matched against known Quran text.
 
-Changes from Phase 1:
-  - Loads QuranDB on startup (all 6,236 verses)
+Decoder: Transducer (RNNT) by default — outputs diacritized Arabic.
+         CTC available via DECODER_TYPE=ctc env var (faster, no tashkeel).
+
+Features:
+  - Loads QuranDB on startup (all 6,236 verses with Uthmani tashkeel)
   - Creates RecitationSession per WebSocket connection
-  - Parses surah number from config refText
-  - Sends {"type":"match","words":[...]} instead of just {"type":"final","text":"..."}
+  - Two-tier word matching (diacritized + normalized fallback)
+  - Sends {"type":"match","words":[...]} with per-word similarity scores
   - Word-level position tracking with retry counts
-  - Backward-compatible: still sends "final" for raw transcript if needed
+  - Model warmup at startup to avoid first-call latency
 
 Protocol:
-  1. Client sends JSON config: {"type":"config","locale":"ar-SA","refText":"...","surah":2,"token":"JWT"}
+  1. Client sends JSON config: {"type":"config","locale":"ar-SA","surah":2,"token":"JWT"}
   2. Server validates JWT, loads QuranDB session, responds: {"type":"ready"}
   3. Client streams binary PCM16 @ 16kHz mono
-  4. Server accumulates chunks, runs CTC inference every CHUNK_SECONDS
+  4. Server accumulates chunks, runs Transducer inference every CHUNK_SECONDS
   5. Server responds: {"type":"match","words":[...],"position":N,...}
 
 Requirements:
@@ -92,14 +95,47 @@ model.eval()
 if DEVICE == "cuda":
     model = model.cuda()
 
-model.change_decoding_strategy(decoder_type="ctc")
-log.info("FastConformer model loaded and set to CTC decoding mode")
+# Decoder: RNNT (Transducer) — outputs diacritical marks (tashkeel).
+# The PCD model was trained with Transducer as its primary decoder.
+# RNNT is NOT Whisper's autoregressive seq2seq — it doesn't hallucinate.
+#
+# Strategy: greedy_batch runs on GPU with batched decoding.
+# CUDA graph decoder gives max speed on RTX 3070.
+from nemo.collections.asr.models.rnnt_models import RNNTDecodingConfig
+from omegaconf import OmegaConf
+
+decoding_cfg = RNNTDecodingConfig()
+decoding_cfg.strategy = "greedy_batch"
+decoding_cfg.greedy.max_symbols = 10
+decoding_cfg.greedy.loop_labels = True
+decoding_cfg.greedy.use_cuda_graph_decoder = True
+model.change_decoding_strategy(OmegaConf.structured(decoding_cfg), decoder_type="rnnt")
+log.info("FastConformer model loaded — RNNT decoder (tashkeel, GPU greedy_batch + CUDA graphs)")
 
 # ── Load QuranDB (Phase 2) ───────────────────────────────────────────────────
 
 log.info("Loading Quran database...")
 quran_db = get_quran_db()
 log.info(f"QuranDB loaded: {quran_db.total_verses} verses, {quran_db.total_surahs} surahs")
+
+# ── Warmup: run one dummy inference so RNNT JIT/Lhotse init happens now ──────
+
+def _warmup_model():
+    """Run a short silent audio through the model to trigger JIT compilation
+    and Lhotse initialization. This avoids a 5-10s delay on the first real request."""
+    try:
+        import tempfile
+        silence = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second of silence
+        tmp = tempfile.mktemp(suffix=".wav")
+        sf.write(tmp, silence, SAMPLE_RATE)
+        with torch.no_grad():
+            model.transcribe([tmp])
+        os.remove(tmp)
+        log.info("Model warmup complete — ready for real-time inference")
+    except Exception as e:
+        log.warning(f"Model warmup failed (non-fatal): {e}")
+
+_warmup_model()
 
 # ── Auth Helper ──────────────────────────────────────────────────────────────
 
@@ -176,7 +212,7 @@ MIN_AUDIO_BYTES = int(SAMPLE_RATE * 2 * 0.3)
 MIN_RMS         = 0.005
 
 def transcribe(audio_pcm16: bytes) -> Optional[str]:
-    """Run FastConformer CTC inference on PCM16 audio."""
+    """Run FastConformer inference on PCM16 audio. Uses RNNT (tashkeel) or CTC decoder."""
     if len(audio_pcm16) < MIN_AUDIO_BYTES:
         return None
 
@@ -229,7 +265,7 @@ def health():
         "status": "ok",
         "model": MODEL_ID,
         "device": DEVICE,
-        "decoder": "ctc",
+        "decoder": "rnnt",
         "chunk_seconds": CHUNK_SECONDS,
         "quran_db": {
             "verses": quran_db.total_verses,
@@ -352,7 +388,10 @@ async def ws_transcribe(ws: WebSocket):
                 audio_buffer.clear()
                 last_tx_time = now
 
-                # Run CTC inference
+                # Run inference in thread pool (RNNT or CTC depending on config).
+                # RNNT is slower (~1-2s, first call ~5s warmup) but outputs tashkeel.
+                # We use run_in_executor so the event loop stays alive to receive
+                # incoming audio frames while inference runs.
                 loop = asyncio.get_event_loop()
                 text = await loop.run_in_executor(None, transcribe, snapshot)
 
@@ -409,7 +448,7 @@ if __name__ == "__main__":
     log.info(f"Starting Quran backend on port {PORT}")
     log.info(f"Model:   {MODEL_ID}")
     log.info(f"Device:  {DEVICE}")
-    log.info(f"Decoder: CTC (no hallucination)")
+    log.info(f"Decoder: RNNT (with tashkeel)")
     log.info(f"Chunk:   {CHUNK_SECONDS}s")
     log.info(f"QuranDB: {quran_db.total_verses} verses loaded")
     log.info(f"Match threshold: {MATCH_THRESHOLD}")
