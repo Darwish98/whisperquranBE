@@ -44,9 +44,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Phase 2 imports
 from quran_db import get_quran_db, QuranDB
 from ctc_matcher import RecitationSession
-
-# Phase 3 imports
 from tajweed_rules import annotate_surah
+from word_timing import extract_word_timings, align_timings_to_transcript
+
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 
@@ -224,43 +224,56 @@ def build_tajweed_cache(surah_num: int) -> dict:
 MIN_AUDIO_BYTES = int(SAMPLE_RATE * 2 * 0.3)
 MIN_RMS         = 0.005
 
-def transcribe(audio_pcm16: bytes) -> Optional[str]:
-    """Run FastConformer RNNT inference on PCM16 audio. Outputs diacritized Arabic."""
+def transcribe(audio_pcm16: bytes) -> Tuple[Optional[str], Optional[object]]:
+    """
+    Run FastConformer RNNT inference on PCM16 audio.
+    Returns (text, hypothesis) where hypothesis carries token-level timestamps.
+    Returns (None, None) if audio is too short, silent, or transcription fails.
+
+    Phase 4: return_hypotheses=True gives us .timestep per token for word timing.
+    """
     if len(audio_pcm16) < MIN_AUDIO_BYTES:
-        return None
+        return None, None
 
     samples = np.frombuffer(audio_pcm16, dtype=np.int16).astype(np.float32) / 32768.0
     rms = np.sqrt(np.mean(samples ** 2))
     if rms < MIN_RMS:
-        return None
+        return None, None
 
+    audio_duration_ms = (len(samples) / SAMPLE_RATE) * 1000.0
     tmp = tempfile.mktemp(suffix=".wav")
     try:
         sf.write(tmp, samples, SAMPLE_RATE)
 
         with torch.no_grad():
-            transcriptions = model.transcribe([tmp])
+            # return_hypotheses=True → get Hypothesis objects with .timestep
+            hypotheses = model.transcribe([tmp], return_hypotheses=True)
 
-        result = transcriptions[0]
-        if isinstance(result, str):
-            text = result.strip()
+        hyp = hypotheses[0]
+
+        # Hypothesis object has .text; plain-string fallback for safety
+        if isinstance(hyp, str):
+            text = hyp.strip()
+            hypothesis = None
         else:
-            text = getattr(result, 'text', str(result)).strip()
+            text = getattr(hyp, "text", str(hyp)).strip()
+            # Attach audio duration so word_timing.py can clamp the last word
+            hyp._audio_duration_ms = audio_duration_ms
+            hypothesis = hyp
 
         if not text or len(text) <= 2:
-            return None
+            return None, None
 
-        return text
+        return text, hypothesis
 
     except Exception as e:
         log.error(f"Transcription error: {e}")
-        return None
+        return None, None
     finally:
         try:
             os.remove(tmp)
         except OSError:
             pass
-
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="WhisperQuran Backend (FastConformer + QuranDB + Tajweed)")
@@ -287,7 +300,7 @@ def health():
         "features": ["transcription", "quran_matching", "tajweed_annotations"],
     }
 
-# ── Phase 3: Tajweed REST endpoint ───────────────────────────────────────────
+# ── Phase 3: Tajweed REST endpoints ──────────────────────────────────────────
 
 @app.get("/tajweed/surah/{surah_num}")
 def get_tajweed_annotations(surah_num: int):
@@ -301,6 +314,86 @@ def get_tajweed_annotations(surah_num: int):
         "totalWords": len(annotations),
         "wordsWithRules": sum(1 for a in annotations if a.has_rules),
         "words": [a.to_dict() for a in annotations if a.has_rules],
+    }
+
+
+from pydantic import BaseModel
+from typing import List
+import time as _time
+
+class AnalyzeTajweedRequest(BaseModel):
+    audio_base64: str = ""
+    ayah_words: List[str] = []
+
+@app.post("/analyze-tajweed")
+def analyze_tajweed(req: AnalyzeTajweedRequest):
+    """
+    Analyze tajweed for a list of ayah words.
+    
+    Phase 3: Returns text-based rule identification for each word.
+             Audio is accepted but not analyzed yet (Phase 5).
+             All identified rules are returned as "confirmations" with
+             confidence=1.0 since we can only identify rules, not verify them.
+    
+    Phase 5 (future): Will use audio_base64 for duration-based verification
+             of Ghunna and Madd rules, returning violations when detected.
+    """
+    t0 = _time.time()
+    words = req.ayah_words
+    
+    if not words:
+        return {
+            "rules_found": 0,
+            "rules_checked": 0,
+            "violations": [],
+            "confirmations": [],
+            "score": 1.0,
+            "processing_time_ms": 0,
+            "alignment_method": "text_based",
+        }
+    
+    from tajweed_rules import get_word_tajweed_rules
+    
+    confirmations = []
+    violations = []
+    rules_found = 0
+    
+    for i, word in enumerate(words):
+        next_word = words[i + 1] if i + 1 < len(words) else None
+        is_last = (i == len(words) - 1)
+        
+        rules = get_word_tajweed_rules(word, next_word, is_last)
+        rules_found += len(rules)
+        
+        for r in rules:
+            # Phase 3: All rules are "confirmed" (we can't detect violations
+            # without audio analysis). Confidence = 1.0 for rule identification.
+            # Phase 5 will add actual violation detection for Ghunna/Madd.
+            confirmations.append({
+                "rule": r.rule_category,
+                "sub_type": r.rule,
+                "word": word,
+                "word_index": i,
+                "correct": True,
+                "confidence": 1.0,
+                "expected_duration": (r.harakat_count * 0.2) if r.harakat_count else None,
+                "actual_duration": None,  # Phase 5: measured from audio
+                "timestamp": None,
+                "details": r.description,
+            })
+    
+    elapsed = (_time.time() - t0) * 1000
+    rules_checked = rules_found  # We "checked" all rules we found
+    score = 1.0 if rules_found > 0 else 1.0  # Phase 3: assume correct, Phase 5: calculate
+    
+    return {
+        "rules_found": rules_found,
+        "rules_checked": rules_checked,
+        "violations": violations,
+        "confirmations": confirmations,
+        "score": score,
+        "processing_time_ms": round(elapsed, 1),
+        "alignment_method": "text_based",
     }
 
 # ── WebSocket handler ────────────────────────────────────────────────────────
@@ -427,7 +520,7 @@ async def ws_transcribe(ws: WebSocket):
 
                 # Run RNNT inference in thread pool so event loop stays alive
                 loop = asyncio.get_event_loop()
-                text = await loop.run_in_executor(None, transcribe, snapshot)
+                text, hypothesis = await loop.run_in_executor(None, transcribe, snapshot)
 
                 if text is None:
                     last_text = ""
@@ -443,6 +536,12 @@ async def ws_transcribe(ws: WebSocket):
 
                 last_text = text
 
+                # ── Phase 4: Extract word timings from RNNT hypothesis ────
+                word_timings = []
+                if hypothesis is not None:
+                    audio_dur_ms = getattr(hypothesis, "_audio_duration_ms", 3000.0)
+                    word_timings = extract_word_timings(hypothesis, audio_dur_ms)
+
                 # ── Phase 2 + 3: Match + attach tajweed ──────────────────
                 if session:
                     result = session.match_transcript(
@@ -451,13 +550,34 @@ async def ws_transcribe(ws: WebSocket):
                     )
                     wire = session.to_wire(result)
                     wire["transcript"] = text
-                    
+
                     # Phase 3: Attach tajweed rules to each matched word
-                    for w in wire["words"]:
+                    # Phase 4: Attach word timings
+                    transcript_words = text.strip().split()
+                    aligned_timings = align_timings_to_transcript(
+                        transcript_words, word_timings
+                    )
+                    # Build a quick lookup: spoken_word_index → timing
+                    timing_by_spoken: dict = {}
+                    for i, t in enumerate(aligned_timings):
+                        if t is not None:
+                            timing_by_spoken[i] = t
+
+                    # We need to map each wire word to its position in the
+                    # transcript. wire["words"] are in the order they were
+                    # emitted, which matches transcript order.
+                    for spoken_idx, w in enumerate(wire["words"]):
                         taj = tajweed_cache.get(w["index"])
                         if taj:
                             w["tajweed"] = taj
-                    
+
+                        # Attach timing if available
+                        timing = timing_by_spoken.get(spoken_idx)
+                        if timing:
+                            w["startMs"] = round(timing.start_ms)
+                            w["endMs"] = round(timing.end_ms)
+                            w["durationMs"] = round(timing.duration_ms)
+
                     await send(wire)
                     
                     matched_str = f"{result.words_matched}/{len(result.words)}"
