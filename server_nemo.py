@@ -46,7 +46,7 @@ from quran_db import get_quran_db, QuranDB
 from ctc_matcher import RecitationSession
 from tajweed_rules import annotate_surah
 from word_timing import extract_word_timings, align_timings_to_transcript
-
+from tajweed_duration import verify_word_tajweed
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 
@@ -318,29 +318,42 @@ def get_tajweed_annotations(surah_num: int):
 
 
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional as _Optional
 import time as _time
+
+
+class WordTimingInput(BaseModel):
+    """Per-word timing from Phase 4 WebSocket stream."""
+    word_index: int
+    duration_ms: _Optional[float] = None
+
 
 class AnalyzeTajweedRequest(BaseModel):
     audio_base64: str = ""
     ayah_words: List[str] = []
+    # Phase 5: optional per-word timings from the WebSocket match stream
+    word_timings: List[WordTimingInput] = []
+
 
 @app.post("/analyze-tajweed")
 def analyze_tajweed(req: AnalyzeTajweedRequest):
     """
     Analyze tajweed for a list of ayah words.
-    
-    Phase 3: Returns text-based rule identification for each word.
-             Audio is accepted but not analyzed yet (Phase 5).
-             All identified rules are returned as "confirmations" with
-             confidence=1.0 since we can only identify rules, not verify them.
-    
-    Phase 5 (future): Will use audio_base64 for duration-based verification
-             of Ghunna and Madd rules, returning violations when detected.
+
+    Phase 3: Text-based rule identification — returns all rules as confirmations.
+    Phase 5: Duration-based verification for Madd and Ghunna rules.
+             Uses per-word durationMs values collected during Phase 4 WebSocket
+             streaming (passed in as word_timings[]).
+             Only flags violations with high confidence to avoid false positives.
+
+    Three states per rule:
+      - confirmation (correct=True,  verifiable=False) — rule present, no audio data
+      - correct      (correct=True,  verifiable=True)  — duration sufficient
+      - violation    (correct=False, verifiable=True)  — duration clearly too short
     """
     t0 = _time.time()
     words = req.ayah_words
-    
+
     if not words:
         return {
             "rules_found": 0,
@@ -349,51 +362,82 @@ def analyze_tajweed(req: AnalyzeTajweedRequest):
             "confirmations": [],
             "score": 1.0,
             "processing_time_ms": 0,
-            "alignment_method": "text_based",
+            "alignment_method": "duration_based" if req.word_timings else "text_based",
         }
-    
+
     from tajweed_rules import get_word_tajweed_rules
-    
+
+    # Build timing lookup: word_index → duration_ms
+    timing_map: dict = {}
+    for wt in req.word_timings:
+        if wt.duration_ms is not None:
+            timing_map[wt.word_index] = wt.duration_ms
+
+    has_timing = bool(timing_map)
+
     confirmations = []
     violations = []
     rules_found = 0
-    
+    rules_verified = 0
+
     for i, word in enumerate(words):
         next_word = words[i + 1] if i + 1 < len(words) else None
         is_last = (i == len(words) - 1)
-        
+
         rules = get_word_tajweed_rules(word, next_word, is_last)
         rules_found += len(rules)
-        
+
+        actual_duration_ms = timing_map.get(i)  # None if no timing data
+
         for r in rules:
-            # Phase 3: All rules are "confirmed" (we can't detect violations
-            # without audio analysis). Confidence = 1.0 for rule identification.
-            # Phase 5 will add actual violation detection for Ghunna/Madd.
-            confirmations.append({
+            # Phase 5: verify duration for Madd and Ghunna
+            verdict = verify_word_tajweed(
+                rule=r.rule,
+                harakat_count=r.harakat_count,
+                actual_duration_ms=actual_duration_ms,
+            )
+
+            entry = {
                 "rule": r.rule_category,
                 "sub_type": r.rule,
                 "word": word,
                 "word_index": i,
-                "correct": True,
-                "confidence": 1.0,
-                "expected_duration": (r.harakat_count * 0.2) if r.harakat_count else None,
-                "actual_duration": None,  # Phase 5: measured from audio
+                "correct": verdict.correct,
+                "confidence": verdict.confidence,
+                "expected_duration": verdict.expected_duration_ms / 1000.0 if verdict.expected_duration_ms else None,
+                "actual_duration": actual_duration_ms / 1000.0 if actual_duration_ms else None,
                 "timestamp": None,
-                "details": r.description,
-            })
-    
+                "details": verdict.details,
+            }
+
+            if verdict.verifiable:
+                rules_verified += 1
+
+            if not verdict.correct:
+                violations.append(entry)
+            else:
+                confirmations.append(entry)
+
+    # Score: fraction of verified rules that are correct
+    # Unverified rules (no timing) don't count against score
+    if rules_verified > 0:
+        violation_count = len(violations)
+        score = round(1.0 - (violation_count / max(rules_verified, 1)), 3)
+        score = max(0.0, score)
+    else:
+        score = 1.0  # No timing data → assume correct (Phase 3 fallback)
+
     elapsed = (_time.time() - t0) * 1000
-    rules_checked = rules_found  # We "checked" all rules we found
-    score = 1.0 if rules_found > 0 else 1.0  # Phase 3: assume correct, Phase 5: calculate
-    
+    alignment_method = "duration_based" if has_timing else "text_based"
+
     return {
         "rules_found": rules_found,
-        "rules_checked": rules_checked,
+        "rules_checked": rules_verified,
         "violations": violations,
         "confirmations": confirmations,
         "score": score,
         "processing_time_ms": round(elapsed, 1),
-        "alignment_method": "text_based",
+        "alignment_method": alignment_method,
     }
 
 # ── WebSocket handler ────────────────────────────────────────────────────────
