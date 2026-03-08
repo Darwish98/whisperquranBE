@@ -297,7 +297,7 @@ def health():
             "verses": quran_db.total_verses,
             "surahs": quran_db.total_surahs,
         },
-        "features": ["transcription", "quran_matching", "tajweed_annotations"],
+        "features": ["transcription", "quran_matching", "tajweed_annotations", "word_timing"],
     }
 
 # ── Phase 3: Tajweed REST endpoints ──────────────────────────────────────────
