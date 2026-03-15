@@ -70,7 +70,15 @@ def extract_word_timings(
                         end_ms = word_ts[i + 1].get("start_offset",
                                      entry.get("end_offset", 0)) * ms_per_step
                     else:
-                        end_ms = audio_duration_ms
+                        # Last word: use NeMo's end_offset if available,
+                        # otherwise cap at start + 1200ms to avoid chunk
+                        # boundary artifact inflating the duration.
+                        nemo_end = entry.get("end_offset", 0) * ms_per_step
+                        if nemo_end > start_ms + 50.0:
+                            end_ms = nemo_end
+                        else:
+                            # Fallback cap: reasonable max for one Arabic word
+                            end_ms = min(audio_duration_ms, start_ms + 1200.0)
                     end_ms = max(end_ms, start_ms + 50.0)
                     timings.append(WordTiming(
                         word=entry.get("word", ""),
