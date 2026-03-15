@@ -1,4 +1,4 @@
-"""
+﻿"""
 WhisperQuran Backend — FastConformer + Quran Matching + Tajweed
 ================================================================
 Phase 2: ASR transcription matched against known Quran text.
@@ -30,6 +30,8 @@ import os
 import re
 import time
 import tempfile
+import urllib.request
+import urllib.error
 from collections import deque
 from typing import Optional, Tuple
 
@@ -50,7 +52,7 @@ from tajweed_duration import verify_word_tajweed
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -62,8 +64,10 @@ DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Auth
 SUPABASE_URL       = os.getenv("SUPABASE_URL", "")
-SUPABASE_ANON_KEY  = os.getenv("SUPABASE_ANON_KEY", "")
-JWT_SECRET         = os.getenv("SUPABASE_JWT_SECRET", "")
+SUPABASE_ANON_KEY  = os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY") or ""
+SUPABASE_ANON_KEY  = SUPABASE_ANON_KEY.strip().strip('"').strip("'")
+JWT_SECRET         = os.getenv("SUPABASE_JWT_SECRET", "") or ""
+JWT_SECRET         = JWT_SECRET.strip().strip('"').strip("'")
 SKIP_AUTH          = os.getenv("SKIP_AUTH", "false").lower() == "true"
 
 # Matching
@@ -117,25 +121,26 @@ log.info("Loading Quran database...")
 quran_db = get_quran_db()
 log.info(f"QuranDB loaded: {quran_db.total_verses} verses, {quran_db.total_surahs} surahs")
 
-# ── Warmup: run one dummy inference so RNNT JIT/Lhotse init happens now ──────
+# â”€â”€ Warmup: run one dummy inference so RNNT JIT/Lhotse init happens now â”€â”€â”€â”€â”€â”€
 
 def _warmup_model():
     """Run a short silent audio through the model to trigger JIT compilation
     and Lhotse initialization. This avoids a 5-10s delay on the first real request."""
     try:
         silence = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second of silence
-        tmp = tempfile.mktemp(suffix=".wav")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tmp = tf.name
         sf.write(tmp, silence, SAMPLE_RATE)
         with torch.no_grad():
             model.transcribe([tmp])
         os.remove(tmp)
-        log.info("Model warmup complete — ready for real-time inference")
+        log.info("Model warmup complete â€” ready for real-time inference")
     except Exception as e:
         log.warning(f"Model warmup failed (non-fatal): {e}")
 
 _warmup_model()
 
-# ── Auth Helper ──────────────────────────────────────────────────────────────
+# â”€â”€ Auth Helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def validate_token(token: str) -> Tuple[bool, Optional[str]]:
     """Validate Supabase JWT token. Returns (valid, user_id)."""
@@ -145,21 +150,53 @@ def validate_token(token: str) -> Tuple[bool, Optional[str]]:
     if not token:
         return False, None
 
-    try:
-        import jwt as pyjwt
-        payload = pyjwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-        return True, payload.get("sub")
-    except Exception:
-        if not JWT_SECRET:
-            return True, "unknown"
-        return False, None
+    # 1) Local HS256 verification (legacy JWT secret flow)
+    if JWT_SECRET:
+        try:
+            import jwt as pyjwt
+            payload = pyjwt.decode(
+                token,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+            return True, payload.get("sub")
+        except ModuleNotFoundError:
+            log.warning("PyJWT not installed; skipping local HS256 validation")
+        except Exception as e:
+            log.warning(f"Local JWT validation failed: {type(e).__name__}: {e}")
+    else:
+        log.warning("SUPABASE_JWT_SECRET not set; using Supabase /auth/v1/user fallback")
 
-# ── Repetition Guard ─────────────────────────────────────────────────────────
+    # 2) Supabase /auth/v1/user fallback (works with migrated signing keys)
+    if SUPABASE_URL and SUPABASE_ANON_KEY:
+        try:
+            req = urllib.request.Request(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    uid = data.get("id")
+                    if uid:
+                        return True, uid
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            log.warning(f"Supabase /user auth failed: HTTP {e.code} {body[:200]}")
+        except Exception as e:
+            log.warning(f"Supabase /user auth fallback failed: {type(e).__name__}: {e}")
+
+    if not SUPABASE_ANON_KEY:
+        log.error("SUPABASE_ANON_KEY is missing; cannot verify tokens via Supabase")
+
+    return False, None
 
 def make_repetition_guard(max_repeats: int = 3, window: int = 6):
     recent: deque = deque(maxlen=window)
@@ -177,7 +214,7 @@ def make_repetition_guard(max_repeats: int = 3, window: int = 6):
 
     return check
 
-# ── Surah detection from refText ─────────────────────────────────────────────
+# â”€â”€ Surah detection from refText â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def detect_surah_from_config(msg: dict) -> Optional[int]:
     """Extract surah number from the config message."""
@@ -196,11 +233,11 @@ def detect_surah_from_config(msg: dict) -> Optional[int]:
     
     return None
 
-# ── Phase 3: Build tajweed cache for a surah ─────────────────────────────────
+# â”€â”€ Phase 3: Build tajweed cache for a surah â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_tajweed_cache(surah_num: int) -> dict:
     """
-    Build a dict mapping global_index → tajweed rules for a surah.
+    Build a dict mapping global_index â†’ tajweed rules for a surah.
     Called once per session/surah change, cached for the connection lifetime.
     """
     ann_list = annotate_surah(surah_num, quran_db)
@@ -219,7 +256,7 @@ def build_tajweed_cache(surah_num: int) -> dict:
             ]
     return cache
 
-# ── Transcription ────────────────────────────────────────────────────────────
+# â”€â”€ Transcription â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 MIN_AUDIO_BYTES = int(SAMPLE_RATE * 2 * 0.3)
 MIN_RMS         = 0.005
@@ -241,12 +278,13 @@ def transcribe(audio_pcm16: bytes) -> Tuple[Optional[str], Optional[object]]:
         return None, None
 
     audio_duration_ms = (len(samples) / SAMPLE_RATE) * 1000.0
-    tmp = tempfile.mktemp(suffix=".wav")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tmp = tf.name
     try:
         sf.write(tmp, samples, SAMPLE_RATE)
 
         with torch.no_grad():
-            # return_hypotheses=True → get Hypothesis objects with .timestep
+            # return_hypotheses=True â†’ get Hypothesis objects with .timestep
             hypotheses = model.transcribe([tmp], return_hypotheses=True)
 
         hyp = hypotheses[0]
@@ -274,7 +312,7 @@ def transcribe(audio_pcm16: bytes) -> Tuple[Optional[str], Optional[object]]:
             os.remove(tmp)
         except OSError:
             pass
-# ── FastAPI ──────────────────────────────────────────────────────────────────
+# â”€â”€ FastAPI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app = FastAPI(title="WhisperQuran Backend (FastConformer + QuranDB + Tajweed)")
 
@@ -300,7 +338,7 @@ def health():
         "features": ["transcription", "quran_matching", "tajweed_annotations", "word_timing"],
     }
 
-# ── Phase 3: Tajweed REST endpoints ──────────────────────────────────────────
+# â”€â”€ Phase 3: Tajweed REST endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/tajweed/surah/{surah_num}")
 def get_tajweed_annotations(surah_num: int):
@@ -340,16 +378,16 @@ def analyze_tajweed(req: AnalyzeTajweedRequest):
     """
     Analyze tajweed for a list of ayah words.
 
-    Phase 3: Text-based rule identification — returns all rules as confirmations.
+    Phase 3: Text-based rule identification â€” returns all rules as confirmations.
     Phase 5: Duration-based verification for Madd and Ghunna rules.
              Uses per-word durationMs values collected during Phase 4 WebSocket
              streaming (passed in as word_timings[]).
              Only flags violations with high confidence to avoid false positives.
 
     Three states per rule:
-      - confirmation (correct=True,  verifiable=False) — rule present, no audio data
-      - correct      (correct=True,  verifiable=True)  — duration sufficient
-      - violation    (correct=False, verifiable=True)  — duration clearly too short
+      - confirmation (correct=True,  verifiable=False) â€” rule present, no audio data
+      - correct      (correct=True,  verifiable=True)  â€” duration sufficient
+      - violation    (correct=False, verifiable=True)  â€” duration clearly too short
     """
     t0 = _time.time()
     words = req.ayah_words
@@ -367,7 +405,7 @@ def analyze_tajweed(req: AnalyzeTajweedRequest):
 
     from tajweed_rules import get_word_tajweed_rules
 
-    # Build timing lookup: word_index → duration_ms
+    # Build timing lookup: word_index â†’ duration_ms
     timing_map: dict = {}
     for wt in req.word_timings:
         if wt.duration_ms is not None:
@@ -425,7 +463,7 @@ def analyze_tajweed(req: AnalyzeTajweedRequest):
         score = round(1.0 - (violation_count / max(rules_verified, 1)), 3)
         score = max(0.0, score)
     else:
-        score = 1.0  # No timing data → assume correct (Phase 3 fallback)
+        score = 1.0  # No timing data â†’ assume correct (Phase 3 fallback)
 
     elapsed = (_time.time() - t0) * 1000
     alignment_method = "duration_based" if has_timing else "text_based"
@@ -440,7 +478,7 @@ def analyze_tajweed(req: AnalyzeTajweedRequest):
         "alignment_method": alignment_method,
     }
 
-# ── WebSocket handler ────────────────────────────────────────────────────────
+# â”€â”€ WebSocket handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
@@ -450,8 +488,8 @@ async def ws_transcribe(ws: WebSocket):
 
     authenticated    = False
     user_id          = None
-    session          = None             # RecitationSession — Phase 2
-    tajweed_cache    = {}               # Phase 3: global_index → tajweed rules
+    session          = None             # RecitationSession â€” Phase 2
+    tajweed_cache    = {}               # Phase 3: global_index â†’ tajweed rules
     audio_buffer     = bytearray()
     last_tx_time     = time.time()
     last_text        = ""
@@ -464,7 +502,7 @@ async def ws_transcribe(ws: WebSocket):
             pass
 
     try:
-        # ── Config handshake ─────────────────────────────────────────────
+        # â”€â”€ Config handshake â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             raw = await asyncio.wait_for(ws.receive(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -491,7 +529,7 @@ async def ws_transcribe(ws: WebSocket):
         authenticated = True
         user_id       = uid
 
-        # ── Phase 2 + 3: Create recitation session + tajweed cache ────────
+        # â”€â”€ Phase 2 + 3: Create recitation session + tajweed cache â”€â”€â”€â”€â”€â”€â”€â”€
         surah_num = detect_surah_from_config(msg)
         if surah_num:
             session = RecitationSession(surah=surah_num, db=quran_db)
@@ -499,11 +537,11 @@ async def ws_transcribe(ws: WebSocket):
             log.info(f"[{user_id}] Session: surah {surah_num}, "
                      f"{session.total_words} words, {len(tajweed_cache)} tajweed annotations")
         else:
-            log.info(f"[{user_id}] No surah detected — raw transcript mode")
+            log.info(f"[{user_id}] No surah detected â€” raw transcript mode")
 
         await send({"type": "ready"})
 
-        # ── Audio loop ───────────────────────────────────────────────────
+        # â”€â”€ Audio loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         while True:
             try:
                 raw = await asyncio.wait_for(ws.receive(), timeout=30.0)
@@ -580,13 +618,13 @@ async def ws_transcribe(ws: WebSocket):
 
                 last_text = text
 
-                # ── Phase 4: Extract word timings from RNNT hypothesis ────
+                # â”€â”€ Phase 4: Extract word timings from RNNT hypothesis â”€â”€â”€â”€
                 word_timings = []
                 if hypothesis is not None:
                     audio_dur_ms = getattr(hypothesis, "_audio_duration_ms", 3000.0)
                     word_timings = extract_word_timings(hypothesis, audio_dur_ms)
 
-                # ── Phase 2 + 3: Match + attach tajweed ──────────────────
+                # â”€â”€ Phase 2 + 3: Match + attach tajweed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if session:
                     result = session.match_transcript(
                         text,
@@ -601,23 +639,28 @@ async def ws_transcribe(ws: WebSocket):
                     aligned_timings = align_timings_to_transcript(
                         transcript_words, word_timings
                     )
-                    # Build a quick lookup: spoken_word_index → timing
+                    # Build a quick lookup: spoken_word_index â†’ timing
                     timing_by_spoken: dict = {}
                     for i, t in enumerate(aligned_timings):
                         if t is not None:
                             timing_by_spoken[i] = t
 
-                    # We need to map each wire word to its position in the
-                    # transcript. wire["words"] are in the order they were
-                    # emitted, which matches transcript order.
-                    for spoken_idx, w in enumerate(wire["words"]):
+                    # Map timings only to actually spoken words. wire["words"]
+                    # may include inserted skipped-expected words (spoken=""),
+                    # which must not consume transcript timing slots.
+                    spoken_idx = 0
+                    for w in wire["words"]:
                         taj = tajweed_cache.get(w["index"])
                         if taj:
                             w["tajweed"] = taj
 
-                        # Attach timing if available
-                        timing = timing_by_spoken.get(spoken_idx)
-                        if timing:
+                        if w.get("spoken"):
+                            timing = timing_by_spoken.get(spoken_idx)
+                            spoken_idx += 1
+                        else:
+                            timing = None
+
+                        if timing is not None:
                             w["startMs"] = round(timing.start_ms)
                             w["endMs"] = round(timing.end_ms)
                             w["durationMs"] = round(timing.duration_ms)
@@ -644,7 +687,7 @@ async def ws_transcribe(ws: WebSocket):
     finally:
         log.info(f"Client disconnected: {client} (user={user_id})")
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if __name__ == "__main__":
     log.info(f"Starting Quran backend on port {PORT}")
@@ -656,3 +699,12 @@ if __name__ == "__main__":
     log.info(f"Tajweed: 14 rule types (text-based, Phase 3)")
     log.info(f"Match threshold: {MATCH_THRESHOLD}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+
+
+
+
+
+
+
+
+
