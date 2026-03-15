@@ -181,7 +181,7 @@ def _make_annotation(rule, char_start, char_end):
     # harakat_count = expected beat count for audio verification (Phase 5)
     hc = None
     if rule == "madd_2":        hc = 2
-    elif rule == "madd_246":    hc = None  # variable: 2, 4, or 6 — verified by context
+    elif rule == "madd_246":    hc = 2     # minimum expectation at waqf (can be 2/4/6 — we verify the floor)
     elif rule == "madd_muttasil": hc = 4
     elif rule == "madd_munfasil": hc = 4
     elif rule == "madd_6":      hc = 6

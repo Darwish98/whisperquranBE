@@ -44,30 +44,31 @@ log = logging.getLogger("whisperquran.tajweed_duration")
 
 # ── Duration model ────────────────────────────────────────────────────────────
 
-# ms per harakat count at moderate recitation speed
-MS_PER_COUNT = 150.0
+# ms per harakat count at moderate recitation speed (~120ms is more realistic
+# than 150ms — measured against actual recitation samples)
+MS_PER_COUNT = 120.0
 
-# Violation threshold: fraction of expected duration below which we flag
-# Set conservatively at 50% — only flag when clearly too short
-VIOLATION_THRESHOLD_RATIO = 0.50
+# Violation threshold: flag if actual < this fraction of expected.
+# 0.70 = must hold at least 70% of expected duration.
+VIOLATION_THRESHOLD_RATIO = 0.70
 
-# Minimum confidence to report a violation (avoid borderline cases)
-# Lowered to 0.50 — the shortfall_ratio * 1.5 formula already handles
-# borderline cases; anything below 33% of expected is always flagged
-MIN_VIOLATION_CONFIDENCE = 0.50
+# Minimum confidence to report a violation.
+# 0.35 is strict enough to be meaningful without hair-trigger false positives.
+MIN_VIOLATION_CONFIDENCE = 0.35
 
-# Rules verifiable by duration alone
+# Rules verifiable by duration alone.
+# Ghunna REMOVED — nasalization requires frequency analysis, not just duration.
 DURATION_VERIFIABLE = {
     "madd_2", "madd_246", "madd_muttasil", "madd_munfasil", "madd_6",
-    "ghunnah",
 }
 
-# Rules NOT verifiable by duration — always return as confirmation
+# Rules NOT verifiable by duration — always return as educational note only
 DURATION_NOT_VERIFIABLE = {
+    "ghunnah",       # needs nasal frequency analysis — out of scope for MVP
     "ikhfa", "ikhfa_shafawi",
     "idgham_ghunnah", "idgham_no_ghunnah", "idgham_shafawi",
     "iqlab",
-    "qalqalah",
+    "qalqalah",      # needs burst-energy detection — high false-positive risk
     "lam_shamsiyyah",
 }
 
@@ -151,8 +152,8 @@ def verify_word_tajweed(
 
     # Compare actual vs threshold
     if actual_duration_ms >= threshold_ms:
-        # Correct — duration is sufficient
-        # Confidence: how comfortably above threshold
+        # ── State: VERIFIED GOOD ─────────────────────────────────────────────
+        # Duration is sufficient. Confidence = how comfortably above threshold.
         margin = (actual_duration_ms - threshold_ms) / expected_ms
         confidence = min(1.0, 0.7 + margin * 0.3)
         return TajweedVerdict(
@@ -169,27 +170,30 @@ def verify_word_tajweed(
             ),
         )
     else:
-        # Possible violation — duration is below threshold
-        # Confidence: how far below threshold
+        # Duration is below threshold
         shortfall_ratio = (threshold_ms - actual_duration_ms) / threshold_ms
         confidence = round(min(1.0, shortfall_ratio * 1.5), 3)
 
-        if confidence <= MIN_VIOLATION_CONFIDENCE and actual_duration_ms > threshold_ms * 0.5:
-            # Borderline — not confident enough, report as unverified
+        if confidence < MIN_VIOLATION_CONFIDENCE:
+            # ── State: BORDERLINE — not confident enough to flag ─────────────
+            # Return verifiable=True, correct=True so UI shows neutral "~" badge
+            # rather than GOOD (which implies verified) or IMPROVE (false alarm).
             return TajweedVerdict(
                 rule=rule,
                 rule_category=_get_category(rule),
                 correct=True,
-                confidence=0.5,
+                confidence=round(confidence, 3),
                 expected_duration_ms=expected_ms,
                 actual_duration_ms=actual_duration_ms,
                 verifiable=True,
                 details=(
                     f"Duration {actual_duration_ms:.0f}ms — borderline "
-                    f"(expected ≥{threshold_ms:.0f}ms). Not flagging."
+                    f"(need ≥{threshold_ms:.0f}ms). Try holding a little longer."
                 ),
             )
 
+        # ── State: NEEDS PRACTICE ─────────────────────────────────────────────
+        # Clearly too short. Flag it.
         return TajweedVerdict(
             rule=rule,
             rule_category=_get_category(rule),
