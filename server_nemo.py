@@ -93,12 +93,17 @@ from nemo.collections.asr.models.rnnt_models import RNNTDecodingConfig
 from omegaconf import OmegaConf
 
 decoding_cfg = RNNTDecodingConfig()
-decoding_cfg.strategy = "greedy_batch"
+# greedy strategy + preserve_alignments=True + compute_timestamps=True
+# is required to populate .timestep on the hypothesis object.
+# greedy_batch with CUDA graphs never populates .timestep (always None).
+decoding_cfg.strategy = "greedy"
 decoding_cfg.greedy.max_symbols = 10
 decoding_cfg.greedy.loop_labels = True
-decoding_cfg.greedy.use_cuda_graph_decoder = True
+decoding_cfg.greedy.use_cuda_graph_decoder = False
+decoding_cfg.preserve_alignments = True   # populate .alignments on hypothesis
+decoding_cfg.compute_timestamps = True    # populate .timestep on hypothesis
 model.change_decoding_strategy(OmegaConf.structured(decoding_cfg), decoder_type="rnnt")
-log.info("FastConformer loaded — RNNT decoder (tashkeel, GPU greedy_batch + CUDA graphs)")
+log.info("FastConformer loaded — RNNT decoder (tashkeel, greedy + timestamps enabled)")
 
 # ── Load QuranDB ──────────────────────────────────────────────────────────────
 
